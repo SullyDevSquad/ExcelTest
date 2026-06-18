@@ -1,0 +1,186 @@
+name: 'Setup Excel (LTSC 2024)'
+description: 'Installs Microsoft Excel 2024 (Office LTSC) on a Windows runner via the Office Deployment Tool and verifies COM availability. Intended primarily for use inside a custom-image (snapshot) build workflow.'
+
+inputs:
+  office-channel:
+    description: 'Office update channel / product to install (e.g. PerpetualVL2024).'
+    required: false
+    default: 'PerpetualVL2024'
+  edition:
+    description: 'Architecture: 64 or 32.'
+    required: false
+    default: '64'
+  config-path:
+    description: 'Optional path to a custom ODT configuration.xml. If provided, this file is used as-is and the generated config is ignored.'
+    required: false
+    default: ''
+  odt-url:
+    description: 'Direct download URL for the Office Deployment Tool (setup.exe self-extractor). Pin this to an internally-mirrored/approved copy if possible.'
+    required: false
+    default: 'https://download.microsoft.com/download/2/7/A/27AF1BE6-DD20-4CB4-B154-EBAB8A7D4A7E/officedeploymenttool_18129-20158.exe'
+  activate:
+    description: 'Whether to activate via KMS after install (true/false).'
+    required: false
+    default: 'true'
+  kms-host:
+    description: 'KMS host FQDN (only used when activate=true). Runner must have network line-of-sight on TCP 1688.'
+    required: false
+    default: ''
+  kms-port:
+    description: 'KMS port.'
+    required: false
+    default: '1688'
+  verify-com:
+    description: 'Whether to run an Excel COM smoke test after install (true/false).'
+    required: false
+    default: 'true'
+  working-directory:
+    description: 'Directory to download/stage ODT into.'
+    required: false
+    default: '${{ runner.temp }}\odt'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate runner OS
+      shell: pwsh
+      run: |
+        if ($env:RUNNER_OS -ne 'Windows') {
+          Write-Error "setup-excel only supports Windows runners. Current OS: $env:RUNNER_OS"
+          exit 1
+        }
+
+    - name: Create ODT staging directory
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path "${{ inputs.working-directory }}" | Out-Null
+
+    - name: Stage Office Deployment Tool
+      shell: pwsh
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        Write-Host "Downloading Office Deployment Tool..."
+        Invoke-WebRequest -Uri "${{ inputs.odt-url }}" -OutFile "odt.exe" -UseBasicParsing
+        Write-Host "Extracting ODT..."
+        Start-Process -FilePath ".\odt.exe" -ArgumentList "/quiet","/extract:." -Wait -NoNewWindow
+        if (-not (Test-Path ".\setup.exe")) {
+          Write-Error "ODT setup.exe not found after extraction."
+          exit 1
+        }
+
+    - name: Generate ODT configuration.xml
+      if: inputs.config-path == ''
+      shell: pwsh
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        $xmlLines = @(
+          '<Configuration>'
+          '  <Add OfficeClientEdition="${{ inputs.edition }}" Channel="${{ inputs.office-channel }}">'
+          '    <Product ID="ProPlus2024Volume">'
+          '      <Language ID="en-us" />'
+          '      <ExcludeApp ID="Access" />'
+          '      <ExcludeApp ID="Groove" />'
+          '      <ExcludeApp ID="Lync" />'
+          '      <ExcludeApp ID="OneDrive" />'
+          '      <ExcludeApp ID="OneNote" />'
+          '      <ExcludeApp ID="Outlook" />'
+          '      <ExcludeApp ID="PowerPoint" />'
+          '      <ExcludeApp ID="Publisher" />'
+          '      <ExcludeApp ID="Word" />'
+          '    </Product>'
+          '  </Add>'
+          '  <Display Level="None" AcceptEULA="TRUE" />'
+          '  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />'
+          '</Configuration>'
+        )
+        $xmlLines -join [Environment]::NewLine | Set-Content -Path "configuration.xml" -Encoding UTF8
+        Write-Host "Generated configuration.xml"
+
+    - name: Install Office via ODT
+      shell: pwsh
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        $config = if ('${{ inputs.config-path }}' -ne '') { '${{ inputs.config-path }}' } else { '.\configuration.xml' }
+        Write-Host "Running ODT setup with config: $config"
+        $proc = Start-Process -FilePath ".\setup.exe" -ArgumentList "/configure `"$config`"" -Wait -NoNewWindow -PassThru
+        if ($proc.ExitCode -ne 0) {
+          Write-Error "ODT setup.exe exited with code $($proc.ExitCode)."
+          exit $proc.ExitCode
+        }
+        Write-Host "Office installation completed."
+
+    - name: Activate via KMS
+      if: inputs.activate == 'true' && inputs.kms-host != ''
+      shell: pwsh
+      run: |
+        $osppPath = "${env:ProgramFiles}\Microsoft Office\Office16\OSPP.VBS"
+        if (-not (Test-Path $osppPath)) {
+          $osppPath = "${env:ProgramFiles(x86)}\Microsoft Office\Office16\OSPP.VBS"
+        }
+        if (-not (Test-Path $osppPath)) {
+          Write-Error "OSPP.VBS not found — cannot activate."
+          exit 1
+        }
+        Write-Host "Setting KMS host to ${{ inputs.kms-host }}:${{ inputs.kms-port }}..."
+        cscript //nologo "$osppPath" /sethst:${{ inputs.kms-host }}
+        cscript //nologo "$osppPath" /setprt:${{ inputs.kms-port }}
+        cscript //nologo "$osppPath" /act
+        Write-Host "KMS activation complete."
+
+    - name: Verify Excel COM
+      if: inputs.verify-com == 'true'
+      shell: pwsh
+      run: |
+        function Test-IsRetryableComError {
+          param([System.Exception]$Exception)
+          $retryableHResults = @(
+            -2147418111, # 0x80010001 RPC_E_CALL_REJECTED
+            -2146827284  # 0x800AC472 VSTO_E_BUSY / Excel busy
+          )
+          $current = $Exception
+          while ($null -ne $current) {
+            if ($current -is [System.Runtime.InteropServices.COMException] -and $retryableHResults -contains $current.HResult) {
+              return $true
+            }
+            $current = $current.InnerException
+          }
+          return $false
+        }
+
+        function Invoke-ComWithRetry {
+          param(
+            [scriptblock]$Action,
+            [string]$Operation,
+            [int]$MaxAttempts = 20,
+            [int]$DelayMs = 500
+          )
+          for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            try {
+              return & $Action
+            } catch {
+              if ($attempt -lt $MaxAttempts -and (Test-IsRetryableComError -Exception $_.Exception)) {
+                Start-Sleep -Milliseconds $DelayMs
+                continue
+              }
+              throw "COM operation '$Operation' failed on attempt ${attempt}: $($_.Exception.Message)"
+            }
+          }
+        }
+
+        Write-Host "Verifying Excel COM availability..."
+        $excel = $null
+        try {
+          $excel = Invoke-ComWithRetry -Operation "Create Excel.Application" -Action { New-Object -ComObject Excel.Application }
+          Write-Host "Excel version: $($excel.Version)"
+          Write-Host "COM smoke test passed."
+        } catch {
+          Write-Error "Excel COM instantiation failed: $_"
+          exit 1
+        } finally {
+          if ($null -ne $excel) {
+            try { Invoke-ComWithRetry -Operation "Quit Excel" -Action { $excel.Quit() | Out-Null } } catch { Write-Warning "Excel quit warning: $($_.Exception.Message)" }
+            [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) | Out-Null
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+          }
+        }

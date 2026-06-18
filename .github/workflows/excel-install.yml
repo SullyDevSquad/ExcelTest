@@ -1,0 +1,166 @@
+name: Build Windows image with Excel (LTSC 2024)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kms-host:
+        description: 'KMS host FQDN (must be reachable from the runner on TCP 1688)'
+        required: false
+        default: ''
+  schedule:
+    # GitHub recommends rebuilding weekly to keep patches + activation baseline fresh.
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  build-excel-image:
+    # The label of your Windows image-generation runner.
+    runs-on: windows-latest
+
+    steps:
+      # REQUIRED: local composite actions are resolved from the checked-out repo.
+      # Without this step, `./.github/actions/setup-excel` cannot be found.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Excel 2024 (LTSC) + verify COM
+        uses: ./.github/actions/setup-excel
+        with:
+          office-channel: PerpetualVL2024
+          edition: '64'
+          activate: 'true'
+          # Falls back to the empty default on scheduled runs — set a repo/org
+          # variable (vars.KMS_HOST) if you want scheduled builds to activate too.
+          kms-host: ${{ inputs.kms-host || vars.KMS_HOST }}
+          kms-port: '1688'
+          verify-com: 'true'
+
+      - name: Excel functional smoke test
+        shell: pwsh
+        run: |
+          function Test-IsRetryableComError {
+            param([System.Exception]$Exception)
+            $retryableHResults = @(
+              -2147418111, # 0x80010001 RPC_E_CALL_REJECTED
+              -2146827284  # 0x800AC472 VSTO_E_BUSY / Excel busy
+            )
+            $current = $Exception
+            while ($null -ne $current) {
+              if ($current -is [System.Runtime.InteropServices.COMException] -and $retryableHResults -contains $current.HResult) {
+                return $true
+              }
+              $current = $current.InnerException
+            }
+            return $false
+          }
+
+          function Invoke-ComWithRetry {
+            param(
+              [scriptblock]$Action,
+              [string]$Operation,
+              [int]$MaxAttempts = 20,
+              [int]$DelayMs = 500
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              try {
+                return & $Action
+              } catch {
+                if ($attempt -lt $MaxAttempts -and (Test-IsRetryableComError -Exception $_.Exception)) {
+                  Start-Sleep -Milliseconds $DelayMs
+                  continue
+                }
+                throw "COM operation '$Operation' failed on attempt ${attempt}: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          function Release-ComObject {
+            param(
+              [object]$ComObject,
+              [string]$Name
+            )
+            if ($null -ne $ComObject) {
+              try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($ComObject) | Out-Null } catch { Write-Warning "$Name release warning: $($_.Exception.Message)" }
+            }
+          }
+
+          $excel = $null
+          $workbook = $null
+          $sheet = $null
+          $path = Join-Path $env:RUNNER_TEMP "excel-smoke.xlsx"
+
+          try {
+            $excel = Invoke-ComWithRetry -Operation "Create Excel.Application" -Action { New-Object -ComObject Excel.Application }
+            Invoke-ComWithRetry -Operation "Set Visible" -Action { $excel.Visible = $false }
+            Invoke-ComWithRetry -Operation "Set DisplayAlerts" -Action { $excel.DisplayAlerts = $false }
+
+            $workbook = Invoke-ComWithRetry -Operation "Create Workbook" -Action { $excel.Workbooks.Add() }
+            $sheet = Invoke-ComWithRetry -Operation "Get Worksheet 1" -Action { $workbook.Worksheets.Item(1) }
+
+            Invoke-ComWithRetry -Operation "Set A1" -Action { $sheet.Cells.Item(1,1).Value2 = 40 }
+            Invoke-ComWithRetry -Operation "Set B1" -Action { $sheet.Cells.Item(1,2).Value2 = 2 }
+            Invoke-ComWithRetry -Operation "Set C1 Formula" -Action { $sheet.Cells.Item(1,3).Formula = "=A1+B1" }
+            Invoke-ComWithRetry -Operation "Calculate workbook" -Action { $excel.CalculateFull() }
+
+            $result = Invoke-ComWithRetry -Operation "Read C1 result" -Action { $sheet.Cells.Item(1,3).Value2 }
+            if ($result -ne 42) {
+              throw "Unexpected formula result: $result"
+            }
+
+            Invoke-ComWithRetry -Operation "Save workbook" -Action { $workbook.SaveAs($path, 51) } # 51 = .xlsx
+            if (-not (Test-Path $path)) {
+              throw "Workbook was not saved."
+            }
+
+            Write-Host "Excel smoke test passed. File: $path"
+          } finally {
+            if ($workbook) {
+              try { Invoke-ComWithRetry -Operation "Close workbook" -Action { $workbook.Close($false) | Out-Null } } catch { Write-Warning "Workbook close warning: $($_.Exception.Message)" }
+            }
+            if ($excel) {
+              try { Invoke-ComWithRetry -Operation "Quit Excel" -Action { $excel.Quit() | Out-Null } } catch { Write-Warning "Excel quit warning: $($_.Exception.Message)" }
+            }
+
+            Release-ComObject -ComObject $sheet -Name "Sheet"
+            Release-ComObject -ComObject $workbook -Name "Workbook"
+            Release-ComObject -ComObject $excel -Name "Excel"
+
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+          }
+
+      - name: Upload Excel smoke-test workbook
+        uses: actions/upload-artifact@v4
+        with:
+          name: excel-smoke-workbook
+          path: ${{ runner.temp }}\excel-smoke.xlsx
+          if-no-files-found: error
+
+      # Add any further image setup here (e.g., .NET SDKs, your add-in tooling,
+      # COM registration for your VBA modules, certs, etc.).
+      # - name: Install .NET build dependencies
+      #   shell: pwsh
+      #   run: |
+      #     # ...
+
+# ---------------------------------------------------------------------------
+# Per-job alternative (NOT recommended as the primary path):
+# If you ever want to install Excel on a normal build runner instead of baking
+# it into an image, the consuming job looks the same — checkout first, then call
+# the action — just with `runs-on:` pointing at a regular Windows runner and no
+# `snapshot:` key:
+#
+#   jobs:
+#     build:
+#       runs-on: gh-windows-large
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: ./.github/actions/setup-excel
+#           with:
+#             kms-host: ${{ vars.KMS_HOST }}
+# ---------------------------------------------------------------------------
