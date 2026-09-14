@@ -1,0 +1,53 @@
+name: Build Excel LTSC 2024 custom image
+
+on:
+  workflow_dispatch:
+    inputs:
+      kms-host:
+        description: 'KMS host FQDN (must be reachable from the runner on TCP 1688)'
+        required: false
+        default: ''
+  schedule:
+    # GitHub recommends rebuilding weekly to keep patches + activation baseline fresh.
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  build-excel-image:
+    # Configure this repository variable with the name of a Windows x64 larger
+    # runner that has "Enable this runner to generate custom images" selected.
+    runs-on: ${{ vars.EXCEL_IMAGE_BUILDER_RUNNER || 'excel-image-builder' }}
+    snapshot: excel-ltsc-2024
+
+    steps:
+      # REQUIRED: local composite actions are resolved from the checked-out repo.
+      # Without this step, `./.github/actions/setup-excel` cannot be found.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Excel 2024 (LTSC) + verify COM
+        uses: ./.github/actions/setup-excel
+        with:
+          office-channel: PerpetualVL2024
+          edition: '64'
+          activate: 'true'
+          # Falls back to the empty default on scheduled runs — set a repo/org
+          # variable (vars.KMS_HOST) if you want scheduled builds to activate too.
+          kms-host: ${{ inputs.kms-host || vars.KMS_HOST }}
+          kms-port: '1688'
+          verify-com: 'true'
+
+      # Add any further image setup here (e.g., .NET SDKs, your add-in tooling,
+      # COM registration for your VBA modules, certs, etc.).
+      # - name: Install .NET build dependencies
+      #   shell: pwsh
+      #   run: |
+      #     # ...
+
+# ---------------------------------------------------------------------------
+# After this job succeeds, GitHub creates or updates the `excel-ltsc-2024`
+# custom image. Configure a second larger runner to use that image's Latest
+# version, then set the EXCEL_IMAGE_RUNNER repository variable to its name.
+# ---------------------------------------------------------------------------
