@@ -109,6 +109,33 @@ runs:
         }
         Write-Host "Office installation completed."
 
+    - name: Log Office Click-to-Run configuration
+      shell: pwsh
+      run: |
+        $registryPath = 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration'
+        if (Test-Path -LiteralPath $registryPath) {
+          Write-Host "Office Click-to-Run configuration found at $registryPath"
+          $properties = Get-ItemProperty -LiteralPath $registryPath
+          $registryValues = $properties.PSObject.Properties |
+            Where-Object { $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$' } |
+            Sort-Object Name
+
+          foreach ($property in $registryValues) {
+            $value = if ($property.Name -match '(?i)(password|passwd|secret|token|credential|private.?key|product.?key|license.?key)') {
+              '<redacted>'
+            } elseif ($null -eq $property.Value) {
+              '<null>'
+            } elseif ($property.Value -is [System.Array]) {
+              $property.Value -join ', '
+            } else {
+              [string]$property.Value
+            }
+            Write-Host "$($property.Name) = $value"
+          }
+        } else {
+          Write-Warning "Office Click-to-Run configuration was not found at $registryPath after installation."
+        }
+
     - name: Activate via KMS
       if: inputs.activate == 'true' && inputs.kms-host != ''
       shell: pwsh
